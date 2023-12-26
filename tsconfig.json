@@ -1,0 +1,11 @@
+{
+  "include": ["src"],
+  "compilerOptions": {
+    "outDir": "dist",
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ESNext", "WebWorker"],
+    "strict": true
+  }
+}
