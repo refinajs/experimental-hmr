@@ -11,8 +11,15 @@ interface ParseResult {
   localsAst: t.Statement[];
   localsSrc: MagicString;
 
-  mainAst: t.Statement;
+  mainAst: t.CallExpression;
   mainSrc: MagicString;
+}
+
+function isCalleeApp(callee: t.Expression | t.V8IntrinsicIdentifier) {
+  if (callee.type === "V8IntrinsicIdentifier") return false;
+  if (callee.type === "Identifier") return callee.name === "app";
+  if (callee.type === "CallExpression") return isCalleeApp(callee.callee);
+  if (callee.type === "MemberExpression") return isCalleeApp(callee.object);
 }
 
 function parse(src: string): ParseResult {
@@ -26,8 +33,7 @@ function parse(src: string): ParseResult {
     if (
       statement.type === "ExpressionStatement" &&
       statement.expression.type === "CallExpression" &&
-      statement.expression.callee.type === "Identifier" &&
-      statement.expression.callee.name === "app"
+      isCalleeApp(statement.expression.callee)
     ) {
       const mainStart = statement.expression.start!;
       const mainEnd = statement.expression.end!;
@@ -42,7 +48,7 @@ function parse(src: string): ParseResult {
       return {
         localsAst: statements.filter((_, j) => j !== i),
         localsSrc,
-        mainAst: statement,
+        mainAst: statement.expression,
         mainSrc,
       };
     }
@@ -112,10 +118,12 @@ function getBindings({ localsAst, localsSrc }: ParseResult): Binding[] {
     } else if (statement.type === "ImportDeclaration") {
       if (statement.importKind === "type") continue;
       for (const specifier of statement.specifiers) {
-        bindings.push({
-          name: specifier.local.name,
-          readonly: true,
-        });
+        if (specifier.local.name !== "app") {
+          bindings.push({
+            name: specifier.local.name,
+            readonly: true,
+          });
+        }
       }
     }
   }
@@ -137,9 +145,13 @@ function appendExport({ localsSrc }: ParseResult, bindings: Binding[]) {
   localsSrc.append(str);
 }
 
-function wrapMain({ mainSrc }: ParseResult) {
-  mainSrc.prepend(`export default (${localsName}) => {\n`);
-  mainSrc.append(`\n};`);
+function wrapMain({ mainAst, mainSrc }: ParseResult) {
+  mainSrc.update(
+    mainAst.start!,
+    mainAst.arguments[0].start!,
+    `export default (${localsName}) =>`
+  );
+  mainSrc.remove(mainAst.arguments[0].end!, mainAst.end!);
 }
 
 function processStmt(
@@ -171,6 +183,11 @@ function processStmt(
 
     case "ForInStatement":
       const innerBindings2 = new Set(bindings);
+      if (ast.left.type === "VariableDeclaration") {
+        processVariableDeclaration(ast.left, src, innerBindings2);
+      } else {
+        processLVal(ast.left, src, innerBindings2);
+      }
       processExpr(ast.right, src, innerBindings2);
       processStmt(ast.body, src, innerBindings2);
       break;
@@ -179,7 +196,7 @@ function processStmt(
       const innerBindings3 = new Set(bindings);
       if (ast.init) {
         if (ast.init.type === "VariableDeclaration") {
-          processStmt(ast.init, src, innerBindings3);
+          processVariableDeclaration(ast.init, src, innerBindings3);
         } else {
           processExpr(ast.init, src, innerBindings3);
         }
@@ -258,8 +275,6 @@ function processStmt(
       throw new Error("Not implemented: ClassDeclaration");
 
     case "ExportAllDeclaration":
-      break;
-
     case "ExportDefaultDeclaration":
     case "ExportNamedDeclaration":
     case "TSExportAssignment":
@@ -400,10 +415,23 @@ export function processExpr(
       for (const property of ast.properties) {
         switch (property.type) {
           case "ObjectProperty":
-            if (property.key.type !== "PrivateName") {
-              processExpr(property.key, src, bindings);
+            if (property.shorthand) {
+              if (property.key.type !== "Identifier")
+                throw new Error("Object property must be an identifier");
+              const name = property.key.name;
+              if (bindings.has(name)) {
+                src.update(
+                  property.key.start!,
+                  property.key.end!,
+                  `${name}:${getLocalsName(name)}`
+                );
+              }
+            } else {
+              if (property.key.type !== "PrivateName" && property.computed) {
+                processExpr(property.key, src, bindings);
+              }
+              processExprOrPatternLike(property.value, src, bindings);
             }
-            processExprOrPatternLike(property.value, src, bindings);
             break;
           case "SpreadElement":
             processExpr(property.argument, src, bindings);
@@ -458,8 +486,7 @@ export function processExpr(
       break;
 
     case "ImportExpression":
-      // ??????????????????????????????????????????????????????????????????????????????
-      break;
+      throw new Error("Not implemented: " + ast.type);
 
     case "MetaProperty":
       break;
@@ -587,10 +614,104 @@ export function processLVal(
             processLVal(property, src, bindings);
             break;
           case "ObjectProperty":
-            if (property.key.type !== "PrivateName") {
-              processExpr(property.key, src, bindings);
+            if (property.shorthand) {
+              if (property.key.type !== "Identifier")
+                throw new Error("Object property must be an identifier");
+              const name = property.key.name;
+              if (bindings.has(name)) {
+                src.update(
+                  property.key.start!,
+                  property.key.end!,
+                  `${name}:${getLocalsName(name)}`
+                );
+              }
+            } else {
+              if (property.key.type !== "PrivateName" && property.computed) {
+                processExpr(property.key, src, bindings);
+              }
+              // may be assignment pattern
+              processExprOrPatternLike(property.value, src, bindings);
             }
-            processExprOrPatternLike(property.value, src, bindings);
+            break;
+          default:
+            const _exhaustiveCheck: never = property;
+        }
+      }
+      break;
+
+    case "TSParameterProperty":
+      break;
+
+    case "TSAsExpression":
+    case "TSSatisfiesExpression":
+    case "TSTypeAssertion":
+    case "TSNonNullExpression":
+      processExpr(ast.expression, src, bindings);
+      break;
+
+    default:
+      const _exhaustiveCheck: never = ast;
+  }
+}
+
+function processDeclarationId(
+  ast: t.LVal,
+  src: MagicString,
+  bindings: Set<string>
+) {
+  switch (ast.type) {
+    case "Identifier":
+      bindings.delete(ast.name);
+      break;
+
+    case "MemberExpression":
+      throw new Error(`Unsupported declaration type: ${ast.type}`);
+
+    case "RestElement":
+      if (ast.argument.type !== "Identifier")
+        throw new Error("Rest element must be an identifier in variable decl");
+      bindings.delete(ast.argument.name);
+      break;
+
+    case "AssignmentPattern":
+      processDeclarationId(ast.left, src, bindings);
+      // let { a = a } = {}; should throw ReferenceError.
+      processExpr(ast.right, src, bindings);
+      break;
+
+    case "ArrayPattern":
+      for (const element of ast.elements) {
+        if (element) processDeclarationId(element, src, bindings);
+      }
+      break;
+
+    case "ObjectPattern":
+      for (const property of ast.properties) {
+        switch (property.type) {
+          case "RestElement":
+            if (property.argument.type !== "Identifier")
+              throw new Error(
+                "Rest element must be an identifier in variable decl"
+              );
+            bindings.delete(property.argument.name);
+            break;
+          case "ObjectProperty":
+            if (property.shorthand) {
+              if (property.key.type !== "Identifier")
+                throw new Error(
+                  "Object property must be an identifier in variable decl"
+                );
+              bindings.delete(property.key.name);
+            } else {
+              if (property.key.type !== "PrivateName" && property.computed) {
+                processExpr(property.key, src, bindings);
+              }
+              if (!t.isLVal(property.value))
+                throw new Error(
+                  "Object property must be a pattern in variable decl"
+                );
+              processDeclarationId(property.value, src, bindings);
+            }
             break;
           default:
             const _exhaustiveCheck: never = property;
@@ -621,7 +742,7 @@ function processVariableDeclaration(
   const declarations = ast.declarations;
   for (const declaration of declarations) {
     if (declaration.init) processExpr(declaration.init, src, bindings);
-    processLVal(declaration.id, src, bindings);
+    processDeclarationId(declaration.id, src, bindings);
   }
 }
 
@@ -660,7 +781,7 @@ export function compile(src: string) {
   const parseResult = parse(src);
   const bindings = getBindings(parseResult);
   appendExport(parseResult, bindings);
-  processStmt(
+  processExpr(
     parseResult.mainAst,
     parseResult.mainSrc,
     new Set(bindings.map((b) => b.name))
